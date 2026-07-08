@@ -62,6 +62,12 @@ export class AmazonBedrockKnowledgebaseSlackbotStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
+    // Get knowledge base type from context: "VECTOR" or "MANAGED" (default: "MANAGED")
+    const knowledgeBaseType: string = this.node.tryGetContext('knowledgeBaseType') || 'VECTOR';
+    if (knowledgeBaseType !== 'VECTOR' && knowledgeBaseType !== 'MANAGED') {
+      throw new Error('knowledgeBaseType must be either "VECTOR" or "MANAGED"');
+    }
+
     // Get secrets from context or fail if not provided
     const slackBotToken = this.node.tryGetContext('slackBotToken');
     const slackSigningSecret = this.node.tryGetContext('slackSigningSecret');
@@ -228,206 +234,233 @@ export class AmazonBedrockKnowledgebaseSlackbotStack extends cdk.Stack {
     const GUARD_RAIL_ID = Guardrail.attrGuardrailId
     const GUARD_RAIL_VERSION = GuardrailVersion.attrVersion
     
-    //Define OpenSearchServerless Collection & depends on policies
-    const osCollection = new ops.CfnCollection(this, 'osCollection', {
-      name: COLLECTION_NAME,
-      description: 'Slack bedrock vector db',
-      type: 'VECTORSEARCH'
-    });
+    // Knowledge Base creation - conditional on knowledgeBaseType
+    let bedrockkb: bedrock.CfnKnowledgeBase;
 
-    // Define AOSS vector DB encryption policy with AWSOwned key true
-    const aossEncryptionPolicy = new ops.CfnSecurityPolicy(this, 'aossEncryptionPolicy', {
-      name: "bedrock-kb-encryption-policy",
-      type: "encryption",
-      policy: JSON.stringify({
-        Rules: [
-          {
-            ResourceType: 'collection',
-            Resource: [`collection/${COLLECTION_NAME}`]
-          }
-        ],
-        AWSOwnedKey: true
-      }),
-    });
-    osCollection.addDependency(aossEncryptionPolicy);
+    if (knowledgeBaseType === 'VECTOR') {
+      //Define OpenSearchServerless Collection & depends on policies
+      const osCollection = new ops.CfnCollection(this, 'osCollection', {
+        name: COLLECTION_NAME,
+        description: 'Slack bedrock vector db',
+        type: 'VECTORSEARCH'
+      });
 
-    // Define Vector DB network policy with AllowFromPublic true. include collection & dashboard
-    const aossNetworkPolicy = new ops.CfnSecurityPolicy(this, 'aossNetworkPolicy', {
-      name: 'bedrock-kb-network-policy',
-      type: 'network',
-      policy: JSON.stringify([
-        {
+      // Define AOSS vector DB encryption policy with AWSOwned key true
+      const aossEncryptionPolicy = new ops.CfnSecurityPolicy(this, 'aossEncryptionPolicy', {
+        name: "bedrock-kb-encryption-policy",
+        type: "encryption",
+        policy: JSON.stringify({
           Rules: [
             {
               ResourceType: 'collection',
-              Resource: [`collection/${COLLECTION_NAME}`],
+              Resource: [`collection/${COLLECTION_NAME}`]
+            }
+          ],
+          AWSOwnedKey: true
+        }),
+      });
+      osCollection.addDependency(aossEncryptionPolicy);
+
+      // Define Vector DB network policy with AllowFromPublic true. include collection & dashboard
+      const aossNetworkPolicy = new ops.CfnSecurityPolicy(this, 'aossNetworkPolicy', {
+        name: 'bedrock-kb-network-policy',
+        type: 'network',
+        policy: JSON.stringify([
+          {
+            Rules: [
+              {
+                ResourceType: 'collection',
+                Resource: [`collection/${COLLECTION_NAME}`],
+              },
+              {
+                ResourceType: 'dashboard',
+                Resource: [`collection/${COLLECTION_NAME}`],
+              },
+            ],
+            AllowFromPublic: true,
+          },
+        ]),
+      });
+      osCollection.addDependency(aossNetworkPolicy);
+
+      // Define createIndexFunction execution role and policy. Managed role 'AWSLambdaBasicExecutionRole'
+      const createIndexFunctionRole = new iam.Role(this, 'CreateIndexFunctionRole', {
+        assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+      });
+      createIndexFunctionRole.addManagedPolicy(iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole'));
+      createIndexFunctionRole.addToPolicy(new PolicyStatement({
+        actions: [
+          'aoss:APIAccessAll',
+          'aoss:DescribeIndex',
+          'aoss:ReadDocument',
+          'aoss:CreateIndex',
+          'aoss:DeleteIndex',
+          'aoss:UpdateIndex',
+          'aoss:WriteDocument',
+          'aoss:CreateCollectionItems',
+          'aoss:DeleteCollectionItems',
+          'aoss:UpdateCollectionItems',
+          'aoss:DescribeCollectionItems'
+        ],
+        resources: [
+          `arn:aws:aoss:${cdk.Stack.of(this).region}:${cdk.Stack.of(this).account}:collection/*`,
+          `arn:aws:aoss:${cdk.Stack.of(this).region}:${cdk.Stack.of(this).account}:index/*`
+        ],
+        effect: iam.Effect.ALLOW,
+      }));
+
+      // Define a lambda function to create an opensearch serverless index
+      const createIndexFunction = new lambda.Function(this, 'CreateIndexFunction', {
+        runtime: lambda.Runtime.PYTHON_3_13,
+        code: lambda.Code.fromAsset('lambda/CreateIndexFunction'),
+        environment: {
+          "INDEX_NAME": osCollection.attrId,
+        },
+        handler: 'index.handler',
+        timeout: cdk.Duration.minutes(1),
+        role: createIndexFunctionRole
+      });
+
+      // Define OpenSearchServerless access policy to access the index and collection from the Amazon Bedrock execution role and the lambda execution role
+      const aossAccessPolicy = new ops.CfnAccessPolicy(this, 'aossAccessPolicy', {
+        name: 'bedrock-kb-access-policy',
+        type: 'data',
+        policy: JSON.stringify([
+          {
+          Rules: [
+            {
+              ResourceType: "collection",
+              Resource: [`collection/*`],
+              Permission: ["aoss:*"],
             },
             {
-              ResourceType: 'dashboard',
-              Resource: [`collection/${COLLECTION_NAME}`],
+              ResourceType: 'index',
+              Resource: [`index/*/*`],
+              Permission: ['aoss:*'],
             },
           ],
-          AllowFromPublic: true,
-        },
+          // Add principal of bedrock execution role and lambda execution role
+          Principal: [
+            bedrockExecutionRole.roleArn,
+            createIndexFunction.role?.roleArn,
+            `arn:aws:iam::${this.account}:root`
+          ],
+        }
       ]),
-    });
-    osCollection.addDependency(aossNetworkPolicy);
+      });
+      //this.serverlessCollection = osCollection;
+      osCollection.addDependency(aossAccessPolicy);
 
-    // Define createIndexFunction execution role and policy. Managed role 'AWSLambdaBasicExecutionRole'
-    const createIndexFunctionRole = new iam.Role(this, 'CreateIndexFunctionRole', {
-      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
-    });
-    createIndexFunctionRole.addManagedPolicy(iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole'));
-    createIndexFunctionRole.addToPolicy(new PolicyStatement({
-      actions: [
-        'aoss:APIAccessAll',
-        'aoss:DescribeIndex',
-        'aoss:ReadDocument',
-        'aoss:CreateIndex',
-        'aoss:DeleteIndex',
-        'aoss:UpdateIndex',
-        'aoss:WriteDocument',
-        'aoss:CreateCollectionItems',
-        'aoss:DeleteCollectionItems',
-        'aoss:UpdateCollectionItems',
-        'aoss:DescribeCollectionItems'
-      ],
-      resources: [
-        `arn:aws:aoss:${cdk.Stack.of(this).region}:${cdk.Stack.of(this).account}:collection/*`,
-        `arn:aws:aoss:${cdk.Stack.of(this).region}:${cdk.Stack.of(this).account}:index/*`
-      ],
-      effect: iam.Effect.ALLOW,
-    }));
+      const Endpoint = `${osCollection.attrId}.${cdk.Stack.of(this).region}.aoss.amazonaws.com`;
 
-    // Define a lambda function to create an opensearch serverless index
-    const createIndexFunction = new lambda.Function(this, 'CreateIndexFunction', {
-      runtime: lambda.Runtime.PYTHON_3_12,
-      code: lambda.Code.fromAsset('lambda/CreateIndexFunction'),
-      environment: {
-        "INDEX_NAME": osCollection.attrId,
-      },
-      handler: 'index.handler',
-      timeout: cdk.Duration.minutes(1),
-      role: createIndexFunctionRole
-    });
-
-    // Define OpenSearchServerless access policy to access the index and collection from the Amazon Bedrock execution role and the lambda execution role
-    const aossAccessPolicy = new ops.CfnAccessPolicy(this, 'aossAccessPolicy', {
-      name: 'bedrock-kb-access-policy',
-      type: 'data',
-      policy: JSON.stringify([
-        {
-        Rules: [
-          {
-            ResourceType: "collection",
-            Resource: [`collection/*`],
-            Permission: ["aoss:*"],
+      const vectorIndex = new cr.AwsCustomResource(this, 'vectorIndex', {
+        installLatestAwsSdk: true,
+        onCreate: {
+          service: 'Lambda',
+          action: 'invoke',
+          parameters: {
+            FunctionName: createIndexFunction.functionName,
+            InvocationType: 'RequestResponse',
+            Payload: JSON.stringify({
+              RequestType: 'Create',
+              CollectionName: osCollection.name,
+              IndexName: VECTOR_INDEX_NAME,
+              Endpoint: Endpoint,
+            }),
           },
-          {
-            ResourceType: 'index',
-            Resource: [`index/*/*`],
-            Permission: ['aoss:*'],
+          physicalResourceId: cr.PhysicalResourceId.of('vectorIndex'),
+        },
+        onDelete: {
+          service: 'Lambda',
+          action: 'invoke',
+          parameters: {
+            FunctionName: createIndexFunction.functionName,
+            InvocationType: 'RequestResponse',
+            Payload: JSON.stringify({
+              RequestType: 'Delete',
+              CollectionName: osCollection.name,
+              IndexName: VECTOR_INDEX_NAME,
+              Endpoint: Endpoint,
+            }),
           },
-        ],
-        // Add principal of bedrock execution role and lambda execution role
-        Principal: [
-          bedrockExecutionRole.roleArn,
-          createIndexFunction.role?.roleArn,
-          `arn:aws:iam::${this.account}:root`
-        ],
-      }
-    ]),
-    });
-    //this.serverlessCollection = osCollection;
-    osCollection.addDependency(aossAccessPolicy);
-    
-    const Endpoint = `${osCollection.attrId}.${cdk.Stack.of(this).region}.aoss.amazonaws.com`;
-
-    const vectorIndex = new cr.AwsCustomResource(this, 'vectorIndex', {
-      installLatestAwsSdk: true,
-      onCreate: {
-        service: 'Lambda',
-        action: 'invoke',
-        parameters: {
-          FunctionName: createIndexFunction.functionName,
-          InvocationType: 'RequestResponse',
-          Payload: JSON.stringify({
-            RequestType: 'Create',
-            CollectionName: osCollection.name,
-            IndexName: VECTOR_INDEX_NAME,
-            Endpoint: Endpoint,
+          //physicalResourceId: cr.PhysicalResourceId.of('vectorIndexResource'),
+        },
+        policy: cr.AwsCustomResourcePolicy.fromStatements([
+          new iam.PolicyStatement({
+            actions: ['lambda:InvokeFunction'],
+            resources: [createIndexFunction.functionArn],
           }),
-        },
-        physicalResourceId: cr.PhysicalResourceId.of('vectorIndex'),
-      },
-      onDelete: {
-        service: 'Lambda',
-        action: 'invoke',
-        parameters: {
-          FunctionName: createIndexFunction.functionName,
-          InvocationType: 'RequestResponse',
-          Payload: JSON.stringify({
-            RequestType: 'Delete',
-            CollectionName: osCollection.name,
-            IndexName: VECTOR_INDEX_NAME,
-            Endpoint: Endpoint,
-          }),
-        },
-        //physicalResourceId: cr.PhysicalResourceId.of('vectorIndexResource'),
-      },
-      policy: cr.AwsCustomResourcePolicy.fromStatements([
-        new iam.PolicyStatement({
-          actions: ['lambda:InvokeFunction'],
-          resources: [createIndexFunction.functionArn],
-        }),
-      ]),
-      timeout: cdk.Duration.seconds(60),
-    });
+        ]),
+        timeout: cdk.Duration.seconds(60),
+      });
 
-    // Ensure vectorIndex depends on collection
-    vectorIndex.node.addDependency(osCollection);
+      // Ensure vectorIndex depends on collection
+      vectorIndex.node.addDependency(osCollection);
 
-    // Define a Bedrock knowledge base with type opensearch serverless and titan for embedding model
-    const bedrockkb = new bedrock.CfnKnowledgeBase(this, 'bedrockkb', {
-      name: BEDROCK_KB_NAME,
-      description: 'bedrock knowledge base for aws',
-      roleArn: bedrockExecutionRole.roleArn,
-      knowledgeBaseConfiguration: {
-        type: 'VECTOR',
-        vectorKnowledgeBaseConfiguration: {
-          embeddingModelArn: `arn:aws:bedrock:${cdk.Stack.of(this).region}::foundation-model/${EMBEDDING_MODEL}`
-        },
-      },
-      storageConfiguration: {
-        type: 'OPENSEARCH_SERVERLESS',
-        opensearchServerlessConfiguration: {
-          collectionArn: osCollection.attrArn, 
-          fieldMapping: {
-            vectorField: 'bedrock-knowledge-base-default-vector',
-            textField: 'AMAZON_BEDROCK_TEXT_CHUNK',
-            metadataField: 'AMAZON_BEDROCK_METADATA'
+      // Define a Bedrock knowledge base with type opensearch serverless and titan for embedding model
+      bedrockkb = new bedrock.CfnKnowledgeBase(this, 'bedrockkb', {
+        name: BEDROCK_KB_NAME,
+        description: 'bedrock knowledge base for aws',
+        roleArn: bedrockExecutionRole.roleArn,
+        knowledgeBaseConfiguration: {
+          type: 'VECTOR',
+          vectorKnowledgeBaseConfiguration: {
+            embeddingModelArn: `arn:aws:bedrock:${cdk.Stack.of(this).region}::foundation-model/${EMBEDDING_MODEL}`
           },
-          vectorIndexName: VECTOR_INDEX_NAME
         },
-      },
-    });
-    // add a dependency for bedrock kb on the custom resource. Enables vector index to be created before KB
-    bedrockkb.node.addDependency(vectorIndex)
-    bedrockkb.node.addDependency(createIndexFunction)
-    bedrockkb.node.addDependency(osCollection)
-    bedrockkb.node.addDependency(bedrockExecutionRole)
+        storageConfiguration: {
+          type: 'OPENSEARCH_SERVERLESS',
+          opensearchServerlessConfiguration: {
+            collectionArn: osCollection.attrArn,
+            fieldMapping: {
+              vectorField: 'bedrock-knowledge-base-default-vector',
+              textField: 'AMAZON_BEDROCK_TEXT_CHUNK',
+              metadataField: 'AMAZON_BEDROCK_METADATA'
+            },
+            vectorIndexName: VECTOR_INDEX_NAME
+          },
+        },
+      });
+      // add a dependency for bedrock kb on the custom resource. Enables vector index to be created before KB
+      bedrockkb.node.addDependency(vectorIndex)
+      bedrockkb.node.addDependency(createIndexFunction)
+      bedrockkb.node.addDependency(osCollection)
+      bedrockkb.node.addDependency(bedrockExecutionRole)
+
+    } else {
+      // MANAGED knowledge base - no OpenSearch Serverless collection needed
+      bedrockkb = new bedrock.CfnKnowledgeBase(this, 'bedrockkb', {
+        name: BEDROCK_KB_NAME,
+        description: 'bedrock knowledge base for aws',
+        roleArn: bedrockExecutionRole.roleArn,
+        knowledgeBaseConfiguration: {
+          type: 'MANAGED',
+        },
+      } as any);
+      bedrockkb.node.addDependency(bedrockExecutionRole)
+    }
     
     // Define a bedrock knowledge base data source with S3 bucket
     const bedrockKbDataSource = new bedrock.CfnDataSource(this, 'bedrockKbDataSource', {
       name: BEDROCK_KB_DATA_SOURCE,
       knowledgeBaseId: bedrockkb.attrKnowledgeBaseId,
-      dataSourceConfiguration: {
-        type: 'S3',
-        s3Configuration: {
-          bucketArn: s3Bucket.bucketArn
-        }
-      }
+      dataSourceConfiguration: knowledgeBaseType === 'MANAGED'
+        ? { type: 'MANAGED_KNOWLEDGE_BASE_CONNECTOR' } as any
+        : { type: 'S3', s3Configuration: { bucketArn: s3Bucket.bucketArn } }
     });
+
+    if (knowledgeBaseType === 'MANAGED') {
+      bedrockKbDataSource.addPropertyOverride('DataSourceConfiguration.ManagedKnowledgeBaseConnectorConfiguration', {
+        ConnectorParameters: {
+          type: 'S3',
+          version: '1',
+          connectionConfiguration: {
+            bucketName: s3Bucket.bucketName,
+            bucketOwnerAccountId: this.account,
+          },
+        },
+      });
+    }
     
     // Create an IAM policy to allow the lambda to invoke models in Amazon Bedrock
     const lambdaBedrockModelPolicy = new PolicyStatement()
@@ -463,12 +496,13 @@ export class AmazonBedrockKnowledgebaseSlackbotStack extends cdk.Stack {
 
     // Create the SlackDot (slash command) integration to Amazon Bedrock Knowledge base responses. 
     const bedrockKbSlackbotFunction = new lambda.Function(this, 'BedrockKbSlackbotFunction', {
-      runtime: lambda.Runtime.PYTHON_3_12,
+      runtime: lambda.Runtime.PYTHON_3_13,
       memorySize: LAMBDA_MEMORY_SIZE,
       environment: {
         "RAG_MODEL_ID": RAG_MODEL_ID,
         "SLACK_SLASH_COMMAND": SLACK_SLASH_COMMAND,
         "KNOWLEDGEBASE_ID": bedrockkb.attrKnowledgeBaseId,
+        "KNOWLEDGE_BASE_TYPE": knowledgeBaseType,
         // "SLACK_BOT_TOKEN": SLACK_BOT_TOKEN,
         // "SLACK_SIGNING_SECRET": SLACK_SIGNING_SECRET,
         "SLACK_BOT_TOKEN_PARAMETER": botTokenParameter.parameterName,
@@ -479,7 +513,7 @@ export class AmazonBedrockKnowledgebaseSlackbotStack extends cdk.Stack {
       handler: 'index.handler',
       code: lambda.Code.fromAsset('lambda/BedrockKbSlackbotFunction', {
         bundling: {
-          image: lambda.Runtime.PYTHON_3_12.bundlingImage,
+          image: lambda.Runtime.PYTHON_3_13.bundlingImage,
           command: [],
           local: {
             tryBundle(outputDir: string) {
@@ -541,20 +575,34 @@ export class AmazonBedrockKnowledgebaseSlackbotStack extends cdk.Stack {
 
     // CDK NAG Suppression Rules - IAM
     //============================================
-    NagSuppressions.addResourceSuppressionsByPath(
-      this,
-      [
+    const nagPaths = [
         '/AmazonBedrockKnowledgebaseSlackbotStack/BedrockExecutionRole/DefaultPolicy/Resource',
-        '/AmazonBedrockKnowledgebaseSlackbotStack/CreateIndexFunctionRole/DefaultPolicy/Resource',
         '/AmazonBedrockKnowledgebaseSlackbotStack/BedrockKbSlackbotFunction/ServiceRole/DefaultPolicy/Resource',
+        '/AmazonBedrockKnowledgebaseSlackbotStack/BedrockKbSlackbotFunction/ServiceRole/Resource'
+    ];
+    // Only suppress VECTOR-mode resource paths when they exist
+    if (knowledgeBaseType === 'VECTOR') {
+      nagPaths.push(
+        '/AmazonBedrockKnowledgebaseSlackbotStack/CreateIndexFunctionRole/DefaultPolicy/Resource',
         '/AmazonBedrockKnowledgebaseSlackbotStack/CreateIndexFunctionRole/Resource',
         '/AmazonBedrockKnowledgebaseSlackbotStack/AWS679f53fac002430cb0da5b7982bd2287/ServiceRole/Resource',
-        '/AmazonBedrockKnowledgebaseSlackbotStack/BedrockKbSlackbotFunction/ServiceRole/Resource'
-      ],
+      );
+    }
+    NagSuppressions.addResourceSuppressionsByPath(
+      this,
+      nagPaths,
       [
         { id: 'AwsSolutions-IAM5', reason: 'IAM policy ARN limits actions to the AWS Account and AWS Service with conditions' },
         { id: 'AwsSolutions-IAM4', reason: 'IAM managed policies used for sample/demo code' }
       ]
+    );
+
+    // CDK NAG Suppression Rules - Secrets Manager
+    //============================================
+    NagSuppressions.addResourceSuppressionsByPath(
+      this,
+      ['/AmazonBedrockKnowledgebaseSlackbotStack/BedrockKbSlackbotFunction/Resource'],
+      [{ id: 'AwsSolutions-L1', reason: 'Latest Python runtime available in CDK used' }]
     );
 
     // CDK NAG Suppression Rules - Secrets Manager
