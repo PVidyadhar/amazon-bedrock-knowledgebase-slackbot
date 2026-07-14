@@ -66,13 +66,14 @@ app = App(
     signing_secret=signing_secret
 )
 
-# Get the expected slack and AWS account params to local vars. 
+# Get the expected slack and AWS account params to local vars.
 SLACK_SLASH_COMMAND = os.environ['SLACK_SLASH_COMMAND']
-KNOWLEDGEBASE_ID = os.environ['KNOWLEDGEBASE_ID'] 
-RAG_MODEL_ID = os.environ['RAG_MODEL_ID'] 
+KNOWLEDGEBASE_ID = os.environ['KNOWLEDGEBASE_ID']
+RAG_MODEL_ID = os.environ['RAG_MODEL_ID']
 AWS_REGION = os.environ['AWS_REGION']
 GUARD_RAIL_ID = os.environ['GUARD_RAIL_ID']
 GUARD_VERSION = os.environ['GUARD_RAIL_VERSION']
+KNOWLEDGE_BASE_TYPE = os.environ.get('KNOWLEDGE_BASE_TYPE', 'MANAGED')
 
 print(f'GR_ID,{GUARD_RAIL_ID}')
 print(f'GR_V, {GUARD_VERSION}')
@@ -106,18 +107,24 @@ def respond_to_slack_within_3_seconds(body, ack):
 
 def process_command_request(respond, body):
   '''
-    Receive the Slack Slash Command user query and proxy the query to Bedrock Knowledge base ReteriveandGenerate API 
-    and return the response to Slack to be presented in the users chat thread. 
+    Receive the Slack Slash Command user query and proxy the query to Bedrock Knowledge base API
+    and return the response to Slack to be presented in the users chat thread.
+    Uses retrieve_and_generate() for VECTOR KBs and retrieve() for MANAGED KBs.
   '''
   try:
     # Get the user query
     user_query = body["text"]
     logging.info(f"${SLACK_SLASH_COMMAND} - Responding to command: {SLACK_SLASH_COMMAND} - User Query: {user_query}")
 
-    kb_response = get_bedrock_knowledgebase_response(user_query)
-    response_text = kb_response["output"]["text"]
+    if KNOWLEDGE_BASE_TYPE == 'MANAGED':
+      kb_response = get_bedrock_managed_kb_response(user_query)
+      response_text = kb_response
+    else:
+      kb_response = get_bedrock_knowledgebase_response(user_query)
+      response_text = kb_response["output"]["text"]
+
     respond(f"\n${SLACK_SLASH_COMMAND} - Response: {response_text}\n")
-  
+
   except Exception as err:
     print(f"${SLACK_SLASH_COMMAND} - Error: {err}")
     respond(f"${SLACK_SLASH_COMMAND} - Sorry an error occurred. Please try again later. Error: {err}")
@@ -160,6 +167,90 @@ def get_bedrock_knowledgebase_response(user_query):
   )
   logging.info(f"Bedrock Knowledge Base Response: {response}")
   return response
+
+def get_bedrock_managed_kb_response(user_query):
+  '''
+    Get and return the Bedrock Managed Knowledge Base response using AgenticRetrieveStream
+    as the primary retrieval path (query decomposition + managed reranking).
+    Falls back to Retrieve API if AgenticRetrieveStream is unavailable.
+  '''
+
+  client = boto3.client(
+    service_name='bedrock-agent-runtime',
+    region_name=AWS_REGION
+  )
+
+  use_agentic = os.environ.get('USE_AGENTIC_RETRIEVAL', 'true').lower() == 'true'
+  generate_response = os.environ.get('GENERATE_RESPONSE', 'false').lower() == 'true'
+
+  # Primary: AgenticRetrieveStream with managed reranking (disable with USE_AGENTIC_RETRIEVAL=false)
+  if use_agentic:
+    try:
+      response = client.agentic_retrieve_stream(
+        messages=[{'content': {'text': user_query}, 'role': 'user'}],
+        retrievers=[{
+          'configuration': {'knowledgeBase': {
+            'knowledgeBaseId': KNOWLEDGEBASE_ID,
+            'retrievalOverrides': {'maxNumberOfResults': 5},
+          }}
+        }],
+        agenticRetrieveConfiguration={
+          'foundationModelType': 'MANAGED',
+          'rerankingModelType': 'MANAGED',
+        },
+        generateResponse=generate_response
+      )
+
+      results = []
+      for event in response.get('stream', []):
+        if 'result' in event:
+          results = event['result'].get('results', [])
+
+      if results:
+        logging.info(f"Agentic retrieval returned {len(results)} results")
+        response_parts = [r.get('content', {}).get('text', '') for r in results if r.get('content', {}).get('text')]
+        if response_parts:
+          return "\n\n---\n\n".join(response_parts)
+
+    except Exception as e:
+      logging.warning(f"AgenticRetrieveStream unavailable, falling back to Retrieve: {e}")
+
+  # Fallback: standard Retrieve with managedSearchConfiguration
+
+  # Call retrieve() with managedSearchConfiguration for managed KBs
+  response = client.retrieve(
+    knowledgeBaseId=KNOWLEDGEBASE_ID,
+    retrievalQuery={
+      'text': user_query
+    },
+    retrievalConfiguration={
+      'managedSearchConfiguration': {
+        'numberOfResults': 5,
+        'rerankingConfiguration': {
+          'type': 'MANAGED'
+        }
+      }
+    }
+  )
+
+  logging.info(f"Bedrock Managed KB Retrieve Response: {response}")
+
+  # Format the retrieved chunks into a readable response
+  retrieval_results = response.get('retrievalResults', [])
+  if not retrieval_results:
+    return "No relevant information found in the knowledge base."
+
+  # Combine the text content from retrieved chunks
+  response_parts = []
+  for i, result in enumerate(retrieval_results, 1):
+    content = result.get('content', {}).get('text', '')
+    if content:
+      response_parts.append(f"{content}")
+
+  if not response_parts:
+    return "No relevant information found in the knowledge base."
+
+  return "\n\n---\n\n".join(response_parts)
 
 # Init the Slack Slash '/' command handler.
 app.command(SLACK_SLASH_COMMAND)(ack=respond_to_slack_within_3_seconds, lazy=[process_command_request])
